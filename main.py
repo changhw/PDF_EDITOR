@@ -397,6 +397,10 @@ class MainWindow(QMainWindow):
 
         comment_action = QAction("Add Comment", self)
         comment_action.triggered.connect(self.prepare_comment)
+        highlight_comment_action = QAction("Highlight Comment", self)
+        highlight_comment_action.triggered.connect(self.prepare_highlight_comment)
+        box_comment_action = QAction("Box Comment", self)
+        box_comment_action.triggered.connect(self.prepare_box_comment)
         symbol_action = QAction("Add Symbol", self)
         symbol_action.triggered.connect(self.prepare_symbol)
         text_action = QAction("Edit Text", self)
@@ -419,6 +423,8 @@ class MainWindow(QMainWindow):
             zoom_out_action,
             fit_action,
             comment_action,
+            highlight_comment_action,
+            box_comment_action,
             symbol_action,
             text_action,
             erase_action,
@@ -695,10 +701,37 @@ class MainWindow(QMainWindow):
             working_size -= 0.5
         raise ValueError("Replacement text does not fit inside the selected paragraph.")
 
+    def prompt_for_comment_text(self, title: str) -> Optional[str]:
+        text, ok = QInputDialog.getMultiLineText(self, title, "Comment text")
+        if not ok:
+            self.clear_pending_action()
+            return None
+        if not text.strip():
+            QMessageBox.warning(self, "Missing comment", "Enter some comment text.")
+            self.clear_pending_action()
+            return None
+        return text.strip()
+
     def prepare_comment(self) -> None:
         if not self.ensure_document():
             return
         self.set_pending_point_action("comment", message="Click the page where you want to add the comment.")
+
+    def prepare_highlight_comment(self) -> None:
+        if not self.ensure_document():
+            return
+        self.set_pending_rect_action(
+            "highlight_comment",
+            message="Drag a rectangle over the area you want to highlight and comment on.",
+        )
+
+    def prepare_box_comment(self) -> None:
+        if not self.ensure_document():
+            return
+        self.set_pending_rect_action(
+            "box_comment",
+            message="Drag a rectangle over the area you want to box and comment on.",
+        )
 
     def prepare_symbol(self) -> None:
         if not self.ensure_document():
@@ -778,9 +811,8 @@ class MainWindow(QMainWindow):
 
         try:
             if self.pending_action.name == "comment":
-                text, ok = QInputDialog.getMultiLineText(self, "Add comment", "Comment text")
-                if not ok or not text.strip():
-                    self.clear_pending_action()
+                text = self.prompt_for_comment_text("Add comment")
+                if text is None:
                     return
                 annot = page.add_text_annot(page_point, text)
                 annot.set_info(title="Windows PDF Editor", content=text)
@@ -856,6 +888,23 @@ class MainWindow(QMainWindow):
             if self.pending_action.name == "erase_region":
                 page.add_redact_annot(pdf_rect, fill=(1, 1, 1))
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+            elif self.pending_action.name == "highlight_comment":
+                text = self.prompt_for_comment_text("Add highlight comment")
+                if text is None:
+                    return
+                annot = page.add_highlight_annot(pdf_rect)
+                annot.set_colors(stroke=(1.0, 0.92, 0.23))
+                annot.set_info(title="Windows PDF Editor", content=text)
+                annot.update(opacity=0.35)
+            elif self.pending_action.name == "box_comment":
+                text = self.prompt_for_comment_text("Add box comment")
+                if text is None:
+                    return
+                annot = page.add_rect_annot(pdf_rect)
+                annot.set_colors(stroke=(0.86, 0.16, 0.16))
+                annot.set_border(width=2)
+                annot.set_info(title="Windows PDF Editor", content=text)
+                annot.update()
             elif self.pending_action.name == "replace_image":
                 image_path, _ = QFileDialog.getOpenFileName(
                     self,

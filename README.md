@@ -8,6 +8,7 @@ It is designed for local Windows use and provides practical editing tools for vi
 - Open and view PDF files
 - Navigate pages and zoom in or out
 - Add text comments/annotations
+- Add highlight comments and box comments for selected areas
 - Add symbols onto the page
 - Edit text by clicking a paragraph and replacing it in place
 - Erase content regions from a page
@@ -56,6 +57,18 @@ pip install -r requirements.txt
 
 1. Click **Add Comment**.
 2. Click the target point on the page.
+3. Enter the comment text.
+
+### Add a highlight comment
+
+1. Click **Highlight Comment**.
+2. Drag a box over the area to highlight.
+3. Enter the comment text.
+
+### Add a box comment
+
+1. Click **Box Comment**.
+2. Drag a box over the area to outline.
 3. Enter the comment text.
 
 ### Add a symbol
