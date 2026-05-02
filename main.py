@@ -2,6 +2,8 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+import math
+
 import fitz
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QToolBar,
     QTreeWidget,
@@ -90,6 +93,15 @@ class SymbolDialog(QDialog):
         self.font_size = QSpinBox()
         self.font_size.setRange(6, 144)
         self.font_size.setValue(24)
+        self.font_combo = QComboBox()
+        self.font_combo.setEditable(False)
+        self._fonts = [
+            ("Built-in (Helvetica)", "helv", None),
+            ("Built-in (Times)", "tiro", None),
+            ("Built-in (Courier)", "cour", None),
+        ]
+        for label, _name, _path in self._fonts:
+            self.font_combo.addItem(label)
         self.color_button = ColorButton(QColor("#d97706"))
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -97,6 +109,7 @@ class SymbolDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form = QFormLayout(self)
         form.addRow("Symbol", self.symbol_input)
+        form.addRow("Font", self.font_combo)
         form.addRow("Font size", self.font_size)
         form.addRow("Color", self.color_button)
         form.addRow(buttons)
@@ -108,9 +121,12 @@ class SymbolDialog(QDialog):
         if not symbol:
             QMessageBox.warning(self, "Missing symbol", "Enter at least one symbol character.")
             return None
+        _label, font_name, font_file = self._fonts[self.font_combo.currentIndex()]
         return {
             "symbol": symbol,
             "font_size": self.font_size.value(),
+            "font_name": font_name,
+            "font_file": font_file,
             "color": self.color_button.color,
         }
 
@@ -320,6 +336,7 @@ class MainWindow(QMainWindow):
         self.current_page_index = 0
         self.zoom = 1.2
         self.dirty = False
+        self.annotations_dirty = True
         self.pending_action: Optional[PendingAction] = None
         self.hovered_paragraph: Optional[TextParagraph] = None
         self.rendered_width = 1
@@ -359,8 +376,33 @@ class MainWindow(QMainWindow):
             bookmark_actions.addWidget(button)
         bookmark_layout.addLayout(bookmark_actions)
 
+        self.annotation_tree = QTreeWidget()
+        self.annotation_tree.setHeaderLabels(["Annotation", "Page"])
+        self.annotation_tree.itemDoubleClicked.connect(lambda item, _column: self.go_to_annotation(item))
+        self.annotation_tree.setRootIsDecorated(False)
+
+        annotation_panel = QWidget()
+        annotation_layout = QVBoxLayout(annotation_panel)
+        annotation_layout.setContentsMargins(0, 0, 0, 0)
+        annotation_layout.addWidget(self.annotation_tree)
+
+        annotation_actions = QHBoxLayout()
+        show_content_btn = QPushButton("Show Content")
+        delete_annot_btn = QPushButton("Delete")
+        refresh_annot_btn = QPushButton("Refresh")
+        show_content_btn.clicked.connect(self.show_annotation_content)
+        delete_annot_btn.clicked.connect(self.delete_annotation)
+        refresh_annot_btn.clicked.connect(self.load_annotations)
+        for button in (show_content_btn, delete_annot_btn, refresh_annot_btn):
+            annotation_actions.addWidget(button)
+        annotation_layout.addLayout(annotation_actions)
+
+        sidebar_tabs = QTabWidget()
+        sidebar_tabs.addTab(bookmark_panel, "Bookmarks")
+        sidebar_tabs.addTab(annotation_panel, "Annotations")
+
         splitter = QSplitter()
-        splitter.addWidget(bookmark_panel)
+        splitter.addWidget(sidebar_tabs)
         splitter.addWidget(scroll_area)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([280, 1020])
@@ -479,6 +521,7 @@ class MainWindow(QMainWindow):
         self.page_spinner.blockSignals(False)
         self.page_total_label.setText(f"/ {doc.page_count}")
         self.load_bookmarks()
+        self.annotations_dirty = True
         self.render_current_page()
         self.update_title()
 
@@ -531,6 +574,9 @@ class MainWindow(QMainWindow):
         self.page_spinner.blockSignals(True)
         self.page_spinner.setValue(self.current_page_index + 1)
         self.page_spinner.blockSignals(False)
+        if self.annotations_dirty:
+            self.load_annotations()
+            self.annotations_dirty = False
         self.statusBar().showMessage(
             f"Page {self.current_page_index + 1} of {self.doc.page_count} | Zoom {int(self.zoom * 100)}%"
         )
@@ -679,6 +725,28 @@ class MainWindow(QMainWindow):
 
         return best_match
 
+    def detect_background_fill(self, page: fitz.Page, rect: fitz.Rect) -> tuple[float, float, float]:
+        sample_w = rect.x0 + 1.0
+        sample_h = rect.y0 - 3.0
+        sample_x = min(max(sample_w, 0), page.rect.width)
+        sample_y = min(max(sample_h, 0), page.rect.height)
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(0.5, 0.5),
+            clip=fitz.Rect(sample_x - 2, sample_y - 2, sample_x + 2, sample_y + 2),
+            alpha=False,
+        )
+        if pix.samples and len(pix.samples) >= 3:
+            r_sum = g_sum = b_sum = 0
+            count = 0
+            for i in range(0, len(pix.samples), 3):
+                r_sum += pix.samples[i]
+                g_sum += pix.samples[i + 1]
+                b_sum += pix.samples[i + 2]
+                count += 1
+            if count > 0:
+                return (r_sum / count / 255.0, g_sum / count / 255.0, b_sum / count / 255.0)
+        return (1.0, 1.0, 1.0)
+
     def get_fitting_font_size(
         self,
         page: fitz.Page,
@@ -814,15 +882,19 @@ class MainWindow(QMainWindow):
                 text = self.prompt_for_comment_text("Add comment")
                 if text is None:
                     return
-                annot = page.add_text_annot(page_point, text)
+                annot = page.add_text_annot(page_point, text, icon="Note")
                 annot.set_info(title="Windows PDF Editor", content=text)
+                annot.set_opacity(1.0)
                 annot.update()
+                self.annotations_dirty = True
             elif self.pending_action.name == "symbol":
                 payload = self.pending_action.payload or {}
                 page.insert_text(
                     page_point,
                     payload["symbol"],
                     fontsize=payload["font_size"],
+                    fontname=payload.get("font_name", "helv"),
+                    fontfile=payload.get("font_file"),
                     color=qcolor_to_fitz(payload["color"]),
                 )
             elif self.pending_action.name == "edit_text":
@@ -857,7 +929,8 @@ class MainWindow(QMainWindow):
                     data["alignment"],
                     data["font_size"],
                 )
-                page.add_redact_annot(paragraph.rect, fill=(1, 1, 1))
+                bg_fill = self.detect_background_fill(page, paragraph.rect)
+                page.add_redact_annot(paragraph.rect, fill=bg_fill)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                 page.insert_textbox(
                     paragraph.rect,
@@ -896,6 +969,7 @@ class MainWindow(QMainWindow):
                 annot.set_colors(stroke=(1.0, 0.92, 0.23))
                 annot.set_info(title="Windows PDF Editor", content=text)
                 annot.update(opacity=0.35)
+                self.annotations_dirty = True
             elif self.pending_action.name == "box_comment":
                 text = self.prompt_for_comment_text("Add box comment")
                 if text is None:
@@ -905,6 +979,7 @@ class MainWindow(QMainWindow):
                 annot.set_border(width=2)
                 annot.set_info(title="Windows PDF Editor", content=text)
                 annot.update()
+                self.annotations_dirty = True
             elif self.pending_action.name == "replace_image":
                 image_path, _ = QFileDialog.getOpenFileName(
                     self,
@@ -934,8 +1009,16 @@ class MainWindow(QMainWindow):
                         end = pdf_rect.br
                         shape.draw_line(start, end)
                         arrow_size = min(pdf_rect.width, pdf_rect.height) * 0.2
-                        shape.draw_line(end, fitz.Point(end.x - arrow_size, end.y))
-                        shape.draw_line(end, fitz.Point(end.x, end.y - arrow_size))
+                        angle = math.atan2(end.y - start.y, end.x - start.x)
+                        barb_angle = math.radians(25)
+                        shape.draw_line(end, fitz.Point(
+                            end.x - arrow_size * math.cos(angle - barb_angle),
+                            end.y - arrow_size * math.sin(angle - barb_angle),
+                        ))
+                        shape.draw_line(end, fitz.Point(
+                            end.x - arrow_size * math.cos(angle + barb_angle),
+                            end.y - arrow_size * math.sin(angle + barb_angle),
+                        ))
                         fill = None
                     case _:
                         raise ValueError("Unsupported figure type.")
@@ -1062,6 +1145,93 @@ class MainWindow(QMainWindow):
             self.bookmark_tree.takeTopLevelItem(row)
         self.mark_dirty()
         self.save_bookmarks()
+
+    ANNOT_KEY_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def _annot_key(self, annot) -> str:
+        rect = annot.rect
+        return f"{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}"
+
+    def _annot_display(self, annot) -> str:
+        annot_type = annot.type[1] if isinstance(annot.type, tuple) else str(annot.type)
+        info = annot.info
+        content = info.get("content", "") if info else ""
+        preview = content.replace("\n", " ") if content else ""
+        if len(preview) > 60:
+            preview = f"{preview[:57]}..."
+        return f"[{annot_type}] {preview}" if preview else f"[{annot_type}]"
+
+    def load_annotations(self) -> None:
+        self.annotation_tree.clear()
+        if self.doc is None:
+            return
+        for page_idx in range(self.doc.page_count):
+            page = self.doc.load_page(page_idx)
+            for annot in page.annots():
+                item = QTreeWidgetItem([self._annot_display(annot), str(page_idx + 1)])
+                item.setData(0, PAGE_ROLE, page_idx)
+                item.setData(0, self.ANNOT_KEY_ROLE, self._annot_key(annot))
+                self.annotation_tree.addTopLevelItem(item)
+
+    def _find_annot_by_item(self, item: QTreeWidgetItem) -> tuple[Optional[object], Optional[object]]:
+        page_index = int(item.data(0, PAGE_ROLE))
+        target_key = item.data(0, self.ANNOT_KEY_ROLE)
+        page = self.doc.load_page(page_index)
+        for annot in page.annots():
+            if self._annot_key(annot) == target_key:
+                return page, annot
+        return page, None
+
+    def go_to_annotation(self, item: QTreeWidgetItem) -> None:
+        if self.doc is None:
+            return
+        page_index = int(item.data(0, PAGE_ROLE))
+        if 0 <= page_index < self.doc.page_count:
+            self.current_page_index = page_index
+            self.render_current_page()
+
+    def show_annotation_content(self) -> None:
+        if self.doc is None:
+            return
+        item = self.annotation_tree.currentItem()
+        if item is None:
+            QMessageBox.information(self, "No annotation selected", "Select an annotation to view its content.")
+            return
+        _page, annot = self._find_annot_by_item(item)
+        if annot is None:
+            QMessageBox.information(self, "Not found", "Annotation no longer exists.")
+            return
+        info = annot.info
+        content = info.get("content", "") if info else ""
+        if content:
+            QMessageBox.information(self, "Annotation content", content)
+        else:
+            QMessageBox.information(self, "Annotation content", "(No text content in this annotation.)")
+
+    def delete_annotation(self) -> None:
+        if self.doc is None:
+            return
+        item = self.annotation_tree.currentItem()
+        if item is None:
+            QMessageBox.information(self, "No annotation selected", "Select an annotation to delete.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete annotation",
+            "Delete the selected annotation? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        page, annot = self._find_annot_by_item(item)
+        if annot is None:
+            QMessageBox.information(self, "Not found", "Annotation no longer exists.")
+            self.load_annotations()
+            return
+        page.delete_annot(annot)
+        self.mark_dirty()
+        self.annotations_dirty = True
+        self.render_current_page()
 
     def closeEvent(self, event) -> None:
         if self.doc is None or not self.dirty:
