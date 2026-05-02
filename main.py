@@ -1,6 +1,6 @@
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import math
 
@@ -36,6 +36,17 @@ from PySide6.QtWidgets import (
 
 
 PAGE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+def normalize_font_name(raw_name: str) -> str:
+    name = raw_name.split("+")[-1].lower().replace("-", "").replace(" ", "").replace("_", "").replace(",", "")
+    if any(kw in name for kw in ("times", "roman", "tiro")):
+        return "tiro"
+    if any(kw in name for kw in ("helv", "arial")):
+        return "helv"
+    if any(kw in name for kw in ("cour", "mono", "typewriter")):
+        return "cour"
+    return "helv"
 
 
 def qcolor_to_fitz(color: QColor) -> tuple[float, float, float]:
@@ -256,6 +267,15 @@ class TextParagraph:
     alignment: int
 
 
+@dataclass
+class TextSpan:
+    rect: fitz.Rect
+    text: str
+    font_size: float
+    color: QColor
+    font_name: str
+
+
 class PageView(QLabel):
     point_selected = Signal(QPoint)
     point_hovered = Signal(QPoint)
@@ -338,7 +358,7 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.annotations_dirty = True
         self.pending_action: Optional[PendingAction] = None
-        self.hovered_paragraph: Optional[TextParagraph] = None
+        self.hovered_paragraph: Union[TextParagraph, TextSpan, None] = None
         self.rendered_width = 1
         self.rendered_height = 1
         self.page_rect = fitz.Rect(0, 0, 1, 1)
@@ -725,6 +745,42 @@ class MainWindow(QMainWindow):
 
         return best_match
 
+    def get_text_span_at_point(self, page: fitz.Page, page_point: fitz.Point) -> Optional[TextSpan]:
+        text_dict = page.get_text("dict")
+        tolerance = 4 / max(self.zoom, 0.2)
+        best_match: Optional[TextSpan] = None
+        best_area: Optional[float] = None
+
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
+                    if not text.strip():
+                        continue
+                    span_rect = fitz.Rect(span["bbox"]).normalize()
+                    expanded = fitz.Rect(
+                        span_rect.x0 - tolerance,
+                        span_rect.y0 - tolerance,
+                        span_rect.x1 + tolerance,
+                        span_rect.y1 + tolerance,
+                    )
+                    if not expanded.contains(page_point):
+                        continue
+                    area = span_rect.get_area()
+                    if best_area is not None and area >= best_area:
+                        continue
+                    best_area = area
+                    best_match = TextSpan(
+                        rect=span_rect,
+                        text=text,
+                        font_size=float(span.get("size", 12)),
+                        color=fitz_color_to_qcolor(span.get("color", 0)),
+                        font_name=normalize_font_name(str(span.get("font", "helv"))),
+                    )
+        return best_match
+
     def detect_background_fill(self, page: fitz.Page, rect: fitz.Rect) -> tuple[float, float, float]:
         sample_w = rect.x0 + 1.0
         sample_h = rect.y0 - 3.0
@@ -746,28 +802,6 @@ class MainWindow(QMainWindow):
             if count > 0:
                 return (r_sum / count / 255.0, g_sum / count / 255.0, b_sum / count / 255.0)
         return (1.0, 1.0, 1.0)
-
-    def get_fitting_font_size(
-        self,
-        page: fitz.Page,
-        rect: fitz.Rect,
-        text: str,
-        alignment: int,
-        font_size: float,
-    ) -> float:
-        working_size = max(6.0, float(font_size))
-        while working_size >= 6.0:
-            trial_shape = page.new_shape()
-            result = trial_shape.insert_textbox(
-                rect,
-                text,
-                fontsize=working_size,
-                align=alignment,
-            )
-            if result >= 0:
-                return working_size
-            working_size -= 0.5
-        raise ValueError("Replacement text does not fit inside the selected paragraph.")
 
     def prompt_for_comment_text(self, title: str) -> Optional[str]:
         text, ok = QInputDialog.getMultiLineText(self, title, "Comment text")
@@ -815,7 +849,7 @@ class MainWindow(QMainWindow):
             return
         self.set_pending_point_action(
             "edit_text",
-            message="Move over text to preview the paragraph, then click to edit it.",
+            message="Move over a word, then click to edit it in-place.",
         )
 
     def handle_point_hover(self, point: QPoint) -> None:
@@ -826,23 +860,32 @@ class MainWindow(QMainWindow):
         if point.x() < 0 or point.y() < 0:
             self.page_view.set_overlay_rect(None)
             self.hovered_paragraph = None
-            self.statusBar().showMessage("Move over text to preview the paragraph, then click to edit it.")
+            self.statusBar().showMessage("Move over a word, then click to edit it in-place.")
             return
 
         page = self.doc.load_page(self.current_page_index)
-        paragraph = self.get_text_paragraph_at_point(page, self.widget_point_to_page(point))
-        if paragraph is None:
-            self.page_view.set_overlay_rect(None)
-            self.hovered_paragraph = None
-            self.statusBar().showMessage("Move over text to preview the paragraph, then click to edit it.")
+        page_point = self.widget_point_to_page(point)
+        span = self.get_text_span_at_point(page, page_point)
+        if span is not None:
+            self.hovered_paragraph = span
+            self.page_view.set_overlay_rect(self.page_rect_to_widget(span.rect))
+            preview = span.text.strip()
+            self.statusBar().showMessage(f"Edit: \"{preview}\" ({span.font_name}, {span.font_size:.0f}pt) — click to replace")
             return
 
-        self.hovered_paragraph = paragraph
-        self.page_view.set_overlay_rect(self.page_rect_to_widget(paragraph.rect))
-        preview = paragraph.text.replace("\n", " ").strip()
-        if len(preview) > 80:
-            preview = f"{preview[:77]}..."
-        self.statusBar().showMessage(f"Selected paragraph: {preview}")
+        paragraph = self.get_text_paragraph_at_point(page, page_point)
+        if paragraph is not None:
+            self.hovered_paragraph = paragraph
+            self.page_view.set_overlay_rect(self.page_rect_to_widget(paragraph.rect))
+            preview = paragraph.text.replace("\n", " ").strip()
+            if len(preview) > 80:
+                preview = f"{preview[:77]}..."
+            self.statusBar().showMessage(f"Selected paragraph: {preview}")
+            return
+
+        self.page_view.set_overlay_rect(None)
+        self.hovered_paragraph = None
+        self.statusBar().showMessage("Move over a word, then click to edit it in-place.")
 
     def prepare_erase_region(self) -> None:
         if not self.ensure_document():
@@ -898,46 +941,39 @@ class MainWindow(QMainWindow):
                     color=qcolor_to_fitz(payload["color"]),
                 )
             elif self.pending_action.name == "edit_text":
-                paragraph = self.hovered_paragraph
-                if paragraph is None or not paragraph.rect.contains(page_point):
-                    paragraph = self.get_text_paragraph_at_point(page, page_point)
-                if paragraph is None:
+                span = self.get_text_span_at_point(page, page_point)
+                if span is None:
                     self.page_view.set_overlay_rect(None)
                     self.hovered_paragraph = None
-                    self.statusBar().showMessage("No paragraph found there. Move over text and click again.")
+                    self.statusBar().showMessage("No word found there. Move over a word and click again.")
                     return
 
-                dialog = TextEditDialog("Replace text", self, initial_text=paragraph.text)
-                dialog.font_size.setValue(max(6, round(paragraph.font_size)))
-                dialog.color_button.set_color(paragraph.color)
-                alignment_names = {
-                    fitz.TEXT_ALIGN_LEFT: "Left",
-                    fitz.TEXT_ALIGN_CENTER: "Center",
-                    fitz.TEXT_ALIGN_RIGHT: "Right",
-                    fitz.TEXT_ALIGN_JUSTIFY: "Justify",
-                }
-                dialog.alignment.setCurrentText(alignment_names.get(paragraph.alignment, "Left"))
+                dialog = TextEditDialog("Edit text in-place", self, initial_text=span.text)
+                dialog.setWindowTitle("Edit text in-place")
+                dialog.font_size.setValue(max(6, round(span.font_size)))
+                dialog.color_button.set_color(span.color)
                 data = dialog.get_data()
                 if data is None:
                     self.clear_pending_action()
                     return
 
-                fitted_font_size = self.get_fitting_font_size(
-                    page,
-                    paragraph.rect,
-                    data["text"],
-                    data["alignment"],
-                    data["font_size"],
-                )
-                bg_fill = self.detect_background_fill(page, paragraph.rect)
-                page.add_redact_annot(paragraph.rect, fill=bg_fill)
+                padding = 1.0
+                erase_rect = fitz.Rect(
+                    span.rect.x0 - padding,
+                    span.rect.y0 - padding,
+                    span.rect.x1 + padding,
+                    span.rect.y1 + padding,
+                ).normalize()
+                bg_fill = self.detect_background_fill(page, erase_rect)
+                page.add_redact_annot(erase_rect, fill=bg_fill)
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-                page.insert_textbox(
-                    paragraph.rect,
+                insert_point = fitz.Point(span.rect.x0, span.rect.y0)
+                page.insert_text(
+                    insert_point,
                     data["text"],
-                    fontsize=fitted_font_size,
+                    fontsize=data["font_size"],
+                    fontname=normalize_font_name(span.font_name),
                     color=qcolor_to_fitz(data["color"]),
-                    align=data["alignment"],
                 )
             else:
                 return
